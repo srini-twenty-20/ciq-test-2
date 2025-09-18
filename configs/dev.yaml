@@ -1,0 +1,41 @@
+# Development environment configuration for TTB pipeline
+# This file contains settings optimized for local development and testing
+
+# Environment identification
+deployment_environment: "dev"
+
+# S3 Configuration - Development
+s3:
+  bucket: "ciq-dagster"  # Development bucket
+  prefixes:
+    raw_data: "1-ttb-raw-data"
+    processed_data: "2-ttb-processed-data"
+    dimensional_data: "3-ttb-dimensional-data"
+
+# Processing limits for development (smaller batches for faster testing)
+processing:
+  max_sequence_per_batch: 100
+  request_delay_seconds: 0.5
+  max_retries: 3
+  ssl_verify: false  # TTB has cert issues
+  enable_data_quality_checks: true
+  enable_deduplication: true
+
+# Receipt methods to process in development
+receipt_methods:
+  - 1  # e-filed
+  - 2  # mailed
+  - 3  # overnight
+  - 0  # hand-delivered
+
+# Dimensional modeling settings
+dimensional:
+  date_start_year: 2015
+  date_end_year: 2030
+  enable_surrogate_keys: true
+
+# Development-specific overrides
+dev_settings:
+  enable_debug_logging: true
+  create_partitioned_output: true
+  sample_data_only: false  # Set to true to limit data for testing

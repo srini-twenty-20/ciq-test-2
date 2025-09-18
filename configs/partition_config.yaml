@@ -1,0 +1,5 @@
+ops:
+  ttb_partitioned:
+    config:
+      bucket_name: "ciq-dagster"
+      max_sequence_per_batch: 5

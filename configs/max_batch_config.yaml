@@ -1,0 +1,4 @@
+ops:
+  ttb_partitioned:
+    config:
+      max_sequence_per_batch: 99999

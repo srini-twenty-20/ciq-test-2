@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONPATH=src TTB_DATA_TYPES=\"cola-detail,certificate\" dagster asset materialize --select ttb_raw_data,ttb_extracted_data,ttb_cleaned_data,ttb_structured_data --partition \"2024-01-01|001-certificate\" -m ciq_test_2.definitions)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

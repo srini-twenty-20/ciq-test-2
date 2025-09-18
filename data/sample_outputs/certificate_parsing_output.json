@@ -1,0 +1,65 @@
+{
+  "data_type": "certificate",
+  "extraction_errors": [],
+  "parsing_success": true,
+  "ttb_id": "24001001000001",
+  "serial_number": "240001",
+  "brand_name": "DOMAINE JOURDAN",
+  "fanciful_name": "CROIX BOISSEE",
+  "grape_varietals": "CHENIN BLANC",
+  "wine_appellation": "CHINON",
+  "plant_registry_number": "DC-I-418",
+  "contact_phone": "(202) 966-9218",
+  "contact_email": "",
+  "application_date": "01/01/2024",
+  "approval_date": "01/02/2024",
+  "ttb_codes": {
+    "ct_code": "81",
+    "or_code": "51"
+  },
+  "label_images": [
+    {
+      "original_url": "/colasonline/publicViewAttachment.do?filename=Jourdan La Croix Boissee eff Jan 2024.jpg&filetype=l",
+      "alt_text": "Label Image: Brand (front) or keg collar",
+      "type": "Brand (front) or keg collar",
+      "display_dimensions": {
+        "width_pixels": 308,
+        "height_pixels": 356
+      },
+      "physical_dimensions": {
+        "width_inches": 3.2,
+        "height_inches": 3.7
+      },
+      "source_filename": "Jourdan La Croix Boissee eff Jan 2024.jpg"
+    },
+    {
+      "original_url": "/colasonline/publicViewAttachment.do?filename=Jourdan Croix Boisee 2021 front label.jpg&filetype=l",
+      "alt_text": "Label Image: Back",
+      "type": "Back",
+      "display_dimensions": {
+        "width_pixels": 453,
+        "height_pixels": 347
+      },
+      "physical_dimensions": {
+        "width_inches": 3.2,
+        "height_inches": 3.7
+      },
+      "source_filename": "Jourdan Croix Boisee 2021 front label.jpg"
+    }
+  ],
+  "company_name": "(Required)",
+  "address_line_1": "Vintage '59 Imports LLC",
+  "address_line_2": "2800 JENNIFER ST , NW",
+  "signatures": {
+    "applicant_signature": "(Application was e-filed)",
+    "authorized_signature_url": "/colasonline/publicViewSignature.do?ttbid=24001001000001",
+    "authorized_signature_present": true,
+    "signature_dimensions": {
+      "width_pixels": 193,
+      "height_pixels": 49
+    }
+  },
+  "status": "THE STATUS IS APPROVED.",
+  "class_type_code": "DISTILLED SPIRITS",
+  "qualifications": "TTB has not reviewed this label for type size, characters per inch or contrasting background. The responsible industry member must continue to ensure that the mandatory information on the actual labels is displayed in the correct type size, number of characters per inch, and on a contrasting background in accordance with the TTB labeling regulations, 27 CFR parts 4, 5, 7, and 16, as applicable."
+}
