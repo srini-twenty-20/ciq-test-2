@@ -5,8 +5,6 @@ This module provides configurable partition definitions that can be used
 across all TTB assets to ensure consistency and enable testing with minimal partitions.
 """
 from dagster import (
-    StaticPartitionsDefinition,
-    MultiPartitionsDefinition,
     DailyPartitionsDefinition,
     EnvVar
 )
@@ -44,56 +42,16 @@ def get_configurable_daily_partitions() -> DailyPartitionsDefinition:
     )
 
 
-def get_configurable_method_type_partitions() -> StaticPartitionsDefinition:
-    """
-    Get configurable receipt method + data type combinations.
-
-    Environment Variables:
-        TTB_RECEIPT_METHODS: Comma-separated receipt methods (default: "001" for testing)
-        TTB_DATA_TYPES: Comma-separated data types (default: "cola-detail" for testing)
-
-    For production, set:
-        TTB_RECEIPT_METHODS=001,002,003,000
-        TTB_DATA_TYPES=cola-detail,certificate
-    """
-    receipt_methods_str = EnvVar("TTB_RECEIPT_METHODS").get_value("001")
-    data_types_str = EnvVar("TTB_DATA_TYPES").get_value("cola-detail")
-
-    receipt_methods = receipt_methods_str.split(",")
-    data_types = data_types_str.split(",")
-
-    method_type_combinations = []
-    for receipt_method in receipt_methods:
-        for data_type in data_types:
-            method_type_combinations.append(f"{receipt_method.strip()}-{data_type.strip()}")
-
-    return StaticPartitionsDefinition(method_type_combinations)
 
 
-def get_configurable_ttb_partitions() -> MultiPartitionsDefinition:
-    """
-    Get configurable multi-dimensional TTB partitions.
-
-    Combines daily partitions with receipt method + data type combinations.
-    """
-    return MultiPartitionsDefinition({
-        "date": get_configurable_daily_partitions(),
-        "method_type": get_configurable_method_type_partitions(),
-    })
 
 
 # Create the actual partition definitions that assets will use
 daily_partitions = get_configurable_daily_partitions()
-method_type_partitions = get_configurable_method_type_partitions()
-ttb_partitions = get_configurable_ttb_partitions()
 
 
 # For backward compatibility and convenience
 __all__ = [
     "daily_partitions",
-    "method_type_partitions",
-    "ttb_partitions",
-    "get_configurable_daily_partitions",
-    "get_configurable_method_type_partitions",
-    "get_configurable_ttb_partitions"
+    "get_configurable_daily_partitions"
 ]

@@ -1,424 +1,411 @@
 """
-Dimensional Data Assets
+Dimensional Modeling Assets
 
-This module contains assets for dimensional modeling and star schema creation.
-These assets create dimension tables that support analytics and fact tables.
+This module creates star schema dimension tables from structured TTB data.
+Implements proper dimensional modeling with surrogate keys and slowly changing dimensions.
 """
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-from datetime import datetime, date
-from typing import Dict, Any, List, Optional
 import hashlib
-import tempfile
+from datetime import datetime, date, timedelta
+from typing import Dict, Any, List, Optional
 
 from dagster import (
     asset,
-    AssetExecutionContext,
     Config,
     get_dagster_logger,
+    AssetExecutionContext,
     MetadataValue,
     AssetDep
 )
-from dagster_aws.s3 import S3Resource
 
-from .consolidated import ttb_consolidated_data
 from ..config.ttb_partitions import daily_partitions
-from ..utils.ttb_consolidated_schema import get_dimension_schemas
-from ..utils.ttb_transformations import load_ttb_reference_data
+from .processed import ttb_structured_data
 
 
 class DimensionalConfig(Config):
     """Configuration for dimensional modeling assets."""
-    s3_bucket: str = "ciq-dagster"
-    output_prefix: str = "4-ttb-analytics"
     date_dimension_start_year: int = 2015
     date_dimension_end_year: int = 2030
+    enable_data_quality_flags: bool = True
 
 
 @asset(
     group_name="ttb_dimensions",
-    description="Date dimension table with comprehensive calendar attributes",
+    description="Date dimension table with comprehensive date attributes",
     metadata={
-        "dimension_type": "date",
-        "granularity": "daily",
-        "format": "parquet"
+        "data_type": "dimension",
+        "schema": "star",
+        "format": "json"
     }
 )
 def dim_dates(
     context: AssetExecutionContext,
-    config: DimensionalConfig,
-    s3_resource: S3Resource
+    config: DimensionalConfig
 ) -> Dict[str, Any]:
     """
-    Generate a comprehensive date dimension table.
+    Generate comprehensive date dimension table.
 
-    Creates a date dimension covering the specified year range with
-    calendar, fiscal year, and business day attributes.
+    Creates a date dimension with business calendar attributes
+    for time-based analysis and reporting.
 
     Returns:
-        Dictionary containing date dimension statistics
+        Dictionary containing date dimension data
     """
     logger = get_dagster_logger()
 
     logger.info(f"Generating date dimension from {config.date_dimension_start_year} to {config.date_dimension_end_year}")
 
     # Generate date range
-    dates = pd.date_range(
-        start=f"{config.date_dimension_start_year}-01-01",
-        end=f"{config.date_dimension_end_year}-12-31",
-        freq='D'
-    )
+    start_date = date(config.date_dimension_start_year, 1, 1)
+    end_date = date(config.date_dimension_end_year, 12, 31)
 
-    date_data = []
-    for dt in dates:
+    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+
+    date_records = []
+    for dt in date_range:
         date_id = int(dt.strftime('%Y%m%d'))
         fiscal_year = dt.year if dt.month >= 10 else dt.year - 1  # Oct-Sep fiscal year
         fiscal_quarter = ((dt.month - 10) % 12) // 3 + 1 if dt.month >= 10 else ((dt.month + 2) // 3)
 
-        date_data.append({
+        record = {
             'date_id': date_id,
-            'date': dt.date(),
+            'date': dt.date().isoformat(),
             'year': dt.year,
-            'month': dt.month,
             'quarter': (dt.month - 1) // 3 + 1,
+            'month': dt.month,
+            'day': dt.day,
+            'day_of_week': dt.dayofweek + 1,  # 1 = Monday
             'day_of_year': dt.dayofyear,
             'week_of_year': dt.isocalendar()[1],
-            'day_of_week': dt.dayofweek + 1,  # 1-7 instead of 0-6
-            'is_weekend': dt.dayofweek >= 5,
             'fiscal_year': fiscal_year,
             'fiscal_quarter': fiscal_quarter,
+            'is_weekend': dt.dayofweek >= 5,
+            'is_holiday': _is_us_holiday(dt.date()),
             'month_name': dt.strftime('%B'),
             'day_name': dt.strftime('%A'),
-            'quarter_name': f"Q{(dt.month - 1) // 3 + 1}"
-        })
+            'quarter_name': f'Q{(dt.month - 1) // 3 + 1}',
+            'season': _get_season(dt.month),
+            'days_from_epoch': (dt.date() - date(1970, 1, 1)).days
+        }
+        date_records.append(record)
 
-    df = pd.DataFrame(date_data)
-
-    # Save to S3
-    s3_client = s3_resource.get_client()
-    output_key = f"{config.output_prefix}/dimensions/dim_dates/dim_dates.parquet"
-
-    table = pa.Table.from_pandas(df)
-    with tempfile.NamedTemporaryFile() as tmp_file:
-        pq.write_table(table, tmp_file.name)
-        tmp_file.seek(0)
-
-        s3_client.put_object(
-            Bucket=config.s3_bucket,
-            Key=output_key,
-            Body=tmp_file.read(),
-            ContentType='application/octet-stream'
-        )
-
-    logger.info(f"Generated {len(df)} date records saved to {output_key}")
+    logger.info(f"Generated {len(date_records)} date dimension records")
 
     # Add metadata
     context.add_output_metadata({
-        "total_dates": MetadataValue.int(len(df)),
-        "start_date": MetadataValue.text(str(df['date'].min())),
-        "end_date": MetadataValue.text(str(df['date'].max())),
+        "total_dates": MetadataValue.int(len(date_records)),
+        "start_date": MetadataValue.text(start_date.isoformat()),
+        "end_date": MetadataValue.text(end_date.isoformat()),
         "years_covered": MetadataValue.int(config.date_dimension_end_year - config.date_dimension_start_year + 1),
-        "output_location": MetadataValue.text(f"s3://{config.s3_bucket}/{output_key}")
+        "generation_timestamp": MetadataValue.text(datetime.now().isoformat())
     })
 
     return {
-        "total_dates": len(df),
-        "start_date": str(df['date'].min()),
-        "end_date": str(df['date'].max())
+        'dimension_name': 'dates',
+        'records': date_records,
+        'primary_key': 'date_id',
+        'record_count': len(date_records),
+        'generation_timestamp': datetime.now().isoformat()
     }
 
 
 @asset(
+    partitions_def=daily_partitions,
     group_name="ttb_dimensions",
-    description="Company dimension extracted from TTB reference data",
+    description="Company dimension table with deduplication and data quality",
+    deps=[AssetDep(ttb_structured_data)],
     metadata={
-        "dimension_type": "company",
-        "source": "ttb_reference",
-        "format": "parquet"
+        "data_type": "dimension",
+        "schema": "star",
+        "format": "json"
     }
 )
 def dim_companies(
     context: AssetExecutionContext,
     config: DimensionalConfig,
-    s3_resource: S3Resource
+    ttb_structured_data: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Create company dimension table from consolidated TTB data.
+    Create company dimension from structured TTB data.
 
-    Extracts and deduplicates company information from the consolidated
-    dataset to create a clean company dimension.
+    Deduplicates companies and creates surrogate keys for star schema.
+
+    Args:
+        ttb_structured_data: Structured TTB data containing company information
 
     Returns:
-        Dictionary containing company dimension statistics
+        Dictionary containing company dimension data
     """
     logger = get_dagster_logger()
 
-    logger.info("Creating company dimension table")
+    date_str = context.partition_key
+    logger.info(f"Creating company dimension for {date_str}")
 
-    # For now, create a basic company dimension structure
-    # This would be populated from actual consolidated data in a real implementation
+    # Extract company information from structured records
+    structured_records = ttb_structured_data.get('structured_records', [])
 
-    companies_data = [
-        {
-            'company_id': 1,
-            'company_name': 'Sample Company 1',
-            'company_type': 'Brewery',
-            'registration_number': 'REG001',
-            'status': 'Active',
-            'created_date': datetime.now().date()
-        }
-    ]
+    # Track unique companies
+    companies_map = {}
 
-    df = pd.DataFrame(companies_data)
+    for record in structured_records:
+        business_name = record.get('applicant_business_name')
+        mailing_address = record.get('applicant_mailing_address')
 
-    # Save to S3
-    s3_client = s3_resource.get_client()
-    output_key = f"{config.output_prefix}/dimensions/dim_companies/dim_companies.parquet"
+        if business_name:
+            # Create company identifier
+            company_key = _create_company_key(business_name, mailing_address)
 
-    table = pa.Table.from_pandas(df)
-    with tempfile.NamedTemporaryFile() as tmp_file:
-        pq.write_table(table, tmp_file.name)
-        tmp_file.seek(0)
+            if company_key not in companies_map:
+                companies_map[company_key] = {
+                    'company_id': _create_company_id(business_name, mailing_address),
+                    'business_name': business_name,
+                    'mailing_address': mailing_address or '',
+                    'phone': record.get('applicant_phone', ''),
+                    'email': record.get('applicant_email', ''),
+                    'fax': record.get('applicant_fax', ''),
+                    'first_seen_date': date_str,
+                    'last_seen_date': date_str,
+                    'total_applications': 0,
+                    'data_quality_score': _calculate_company_quality_score(record),
+                    'source_ttb_ids': []
+                }
 
-        s3_client.put_object(
-            Bucket=config.s3_bucket,
-            Key=output_key,
-            Body=tmp_file.read(),
-            ContentType='application/octet-stream'
-        )
+            # Update company info
+            company = companies_map[company_key]
+            company['last_seen_date'] = date_str
+            company['total_applications'] += 1
+            company['source_ttb_ids'].append(record.get('ttb_id'))
 
-    logger.info(f"Generated {len(df)} company records saved to {output_key}")
+            # Update contact info if better quality available
+            if not company['phone'] and record.get('applicant_phone'):
+                company['phone'] = record.get('applicant_phone')
+            if not company['email'] and record.get('applicant_email'):
+                company['email'] = record.get('applicant_email')
+
+    company_records = list(companies_map.values())
+
+    logger.info(f"Created {len(company_records)} unique company dimension records")
 
     # Add metadata
     context.add_output_metadata({
-        "total_companies": MetadataValue.int(len(df)),
-        "output_location": MetadataValue.text(f"s3://{config.s3_bucket}/{output_key}")
-    })
-
-    return {
-        "total_companies": len(df)
-    }
-
-
-@asset(
-    group_name="ttb_dimensions",
-    description="Location dimension with geographic information",
-    metadata={
-        "dimension_type": "location",
-        "source": "ttb_reference",
-        "format": "parquet"
-    }
-)
-def dim_locations(
-    context: AssetExecutionContext,
-    config: DimensionalConfig,
-    s3_resource: S3Resource
-) -> Dict[str, Any]:
-    """
-    Create location dimension table with geographic information.
-
-    Returns:
-        Dictionary containing location dimension statistics
-    """
-    logger = get_dagster_logger()
-
-    logger.info("Creating location dimension table")
-
-    # Create basic location dimension
-    locations_data = [
-        {
-            'location_id': 1,
-            'location_name': 'Sample Location',
-            'city': 'Sample City',
-            'state': 'Sample State',
-            'country': 'USA',
-            'region': 'North America'
-        }
-    ]
-
-    df = pd.DataFrame(locations_data)
-
-    # Save to S3
-    s3_client = s3_resource.get_client()
-    output_key = f"{config.output_prefix}/dimensions/dim_locations/dim_locations.parquet"
-
-    table = pa.Table.from_pandas(df)
-    with tempfile.NamedTemporaryFile() as tmp_file:
-        pq.write_table(table, tmp_file.name)
-        tmp_file.seek(0)
-
-        s3_client.put_object(
-            Bucket=config.s3_bucket,
-            Key=output_key,
-            Body=tmp_file.read(),
-            ContentType='application/octet-stream'
+        "unique_companies": MetadataValue.int(len(company_records)),
+        "partition_date": MetadataValue.text(date_str),
+        "source_records": MetadataValue.int(len(structured_records)),
+        "avg_quality_score": MetadataValue.float(
+            sum(c['data_quality_score'] for c in company_records) / len(company_records) if company_records else 0
         )
-
-    logger.info(f"Generated {len(df)} location records saved to {output_key}")
-
-    # Add metadata
-    context.add_output_metadata({
-        "total_locations": MetadataValue.int(len(df)),
-        "output_location": MetadataValue.text(f"s3://{config.s3_bucket}/{output_key}")
     })
 
     return {
-        "total_locations": len(df)
+        'dimension_name': 'companies',
+        'records': company_records,
+        'primary_key': 'company_id',
+        'record_count': len(company_records),
+        'partition_date': date_str,
+        'generation_timestamp': datetime.now().isoformat()
     }
 
 
 @asset(
+    partitions_def=daily_partitions,
     group_name="ttb_dimensions",
-    description="Product type dimension from TTB reference data",
+    description="Product dimension table with classification and attributes",
+    deps=[AssetDep(ttb_structured_data)],
     metadata={
-        "dimension_type": "product_type",
-        "source": "ttb_reference",
-        "format": "parquet"
-    }
-)
-def dim_product_types(
-    context: AssetExecutionContext,
-    config: DimensionalConfig,
-    s3_resource: S3Resource
-) -> Dict[str, Any]:
-    """
-    Create product type dimension from TTB reference data.
-
-    Returns:
-        Dictionary containing product type dimension statistics
-    """
-    logger = get_dagster_logger()
-
-    logger.info("Creating product type dimension from TTB reference data")
-
-    try:
-        # Load TTB reference data
-        reference_data = load_ttb_reference_data()
-        product_types = reference_data.get('product_class_types', {})
-
-        # Convert to dimension format
-        product_data = []
-        for code, description in product_types.get('by_code', {}).items():
-            product_data.append({
-                'product_type_id': int(code) if code.isdigit() else hash(code) % 1000000,
-                'product_type_code': code,
-                'product_type_name': description,
-                'category': 'Alcoholic Beverage',  # All TTB products are alcoholic beverages
-                'is_active': True
-            })
-
-        df = pd.DataFrame(product_data)
-
-        # Save to S3
-        s3_client = s3_resource.get_client()
-        output_key = f"{config.output_prefix}/dimensions/dim_product_types/dim_product_types.parquet"
-
-        table = pa.Table.from_pandas(df)
-        with tempfile.NamedTemporaryFile() as tmp_file:
-            pq.write_table(table, tmp_file.name)
-            tmp_file.seek(0)
-
-            s3_client.put_object(
-                Bucket=config.s3_bucket,
-                Key=output_key,
-                Body=tmp_file.read(),
-                ContentType='application/octet-stream'
-            )
-
-        logger.info(f"Generated {len(df)} product type records saved to {output_key}")
-
-        # Add metadata
-        context.add_output_metadata({
-            "total_product_types": MetadataValue.int(len(df)),
-            "sample_types": MetadataValue.json(df.head(5).to_dict('records')),
-            "output_location": MetadataValue.text(f"s3://{config.s3_bucket}/{output_key}")
-        })
-
-        return {
-            "total_product_types": len(df)
-        }
-
-    except Exception as e:
-        logger.error(f"Error creating product type dimension: {e}")
-        raise
-
-
-@asset(
-    group_name="ttb_reference",
-    description="TTB reference data including origin codes and product class types",
-    metadata={
-        "data_type": "reference",
-        "source": "ttbonline.gov",
+        "data_type": "dimension",
+        "schema": "star",
         "format": "json"
     }
 )
-def ttb_reference_data(
+def dim_products(
     context: AssetExecutionContext,
     config: DimensionalConfig,
-    s3_resource: S3Resource
+    ttb_structured_data: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Download and cache TTB reference data from lookup URLs.
+    Create product dimension from structured TTB data.
 
-    This asset provides:
-    - Origin codes (232 entries): State/country codes for product origins
-    - Product class types (531 entries): Beverage type classifications
+    Creates product dimension with classification and quality attributes.
+
+    Args:
+        ttb_structured_data: Structured TTB data containing product information
 
     Returns:
-        Dictionary containing structured reference data with lookup mappings
+        Dictionary containing product dimension data
     """
     logger = get_dagster_logger()
 
-    logger.info("Downloading TTB reference data...")
+    date_str = context.partition_key
+    logger.info(f"Creating product dimension for {date_str}")
 
-    try:
-        # Load reference data using existing function
-        reference_data = load_ttb_reference_data()
+    # Extract product information from structured records
+    structured_records = ttb_structured_data.get('structured_records', [])
 
-        # Extract statistics for metadata
-        origin_codes = reference_data.get('origin_codes', {})
-        product_types = reference_data.get('product_class_types', {})
+    # Track unique products
+    products_map = {}
 
-        origin_count = len(origin_codes.get('all_codes', []))
-        product_count = len(product_types.get('all_codes', []))
+    for record in structured_records:
+        # Only process records with COLA detail data
+        if not record.get('has_cola_detail'):
+            continue
 
-        # Save to S3
-        import json
-        s3_client = s3_resource.get_client()
-        output_key = f"{config.output_prefix}/reference/ttb_reference_data.json"
+        brand_name = record.get('brand_name')
+        fanciful_name = record.get('fanciful_name')
 
-        json_content = json.dumps(reference_data, indent=2, default=str)
-        s3_client.put_object(
-            Bucket=config.s3_bucket,
-            Key=output_key,
-            Body=json_content.encode('utf-8'),
-            ContentType='application/json'
-        )
+        if brand_name:
+            # Create product identifier
+            product_key = _create_product_key(brand_name, fanciful_name)
 
-        logger.info(f"Reference data loaded: {origin_count} origin codes, {product_count} product types")
+            if product_key not in products_map:
+                products_map[product_key] = {
+                    'product_id': _create_product_id(brand_name, fanciful_name),
+                    'brand_name': brand_name,
+                    'fanciful_name': fanciful_name or '',
+                    'product_description': record.get('product_description', ''),
+                    'class_type_code': record.get('class_type_code', ''),
+                    'origin_code': record.get('origin_code', ''),
+                    'product_category': record.get('product_category', 'OTHER'),
+                    'grape_varietals': record.get('grape_varietals', ''),
+                    'wine_appellation': record.get('cert_wine_appellation', ''),
+                    'alcohol_content': record.get('alcohol_content'),
+                    'net_contents': record.get('net_contents', ''),
+                    'first_seen_date': date_str,
+                    'last_seen_date': date_str,
+                    'total_labels': 0,
+                    'data_quality_score': _calculate_product_quality_score(record),
+                    'source_ttb_ids': []
+                }
 
-        # Add metadata to the asset
-        context.add_output_metadata({
-            "origin_codes_count": MetadataValue.int(origin_count),
-            "product_class_types_count": MetadataValue.int(product_count),
-            "data_sources": MetadataValue.json({
-                "origin_codes": "https://ttbonline.gov/colasonline/lookupOriginCode.do?action=search&display=all",
-                "product_class_types": "https://ttbonline.gov/colasonline/lookupProductClassTypeCode.do?action=search&display=all"
-            }),
-            "sample_origin_codes": MetadataValue.json(dict(list(origin_codes.get('by_code', {}).items())[:5])),
-            "sample_product_types": MetadataValue.json(dict(list(product_types.get('by_code', {}).items())[:5])),
-            "cache_status": MetadataValue.text("Fresh data downloaded from TTB website"),
-            "last_updated": MetadataValue.text(datetime.now().isoformat()),
-            "output_location": MetadataValue.text(f"s3://{config.s3_bucket}/{output_key}")
-        })
+            # Update product info
+            product = products_map[product_key]
+            product['last_seen_date'] = date_str
+            product['total_labels'] += 1
+            product['source_ttb_ids'].append(record.get('ttb_id'))
 
-        return reference_data
+    product_records = list(products_map.values())
 
-    except Exception as e:
-        logger.error(f"Failed to load TTB reference data: {str(e)}")
-        context.add_output_metadata({
-            "error": MetadataValue.text(str(e)),
-            "status": MetadataValue.text("FAILED")
-        })
-        raise
+    logger.info(f"Created {len(product_records)} unique product dimension records")
+
+    # Add metadata
+    context.add_output_metadata({
+        "unique_products": MetadataValue.int(len(product_records)),
+        "partition_date": MetadataValue.text(date_str),
+        "source_records": MetadataValue.int(len(structured_records)),
+        "wine_products": MetadataValue.int(sum(1 for p in product_records if p['product_category'] == 'WINE')),
+        "beer_products": MetadataValue.int(sum(1 for p in product_records if p['product_category'] == 'BEER')),
+        "spirits_products": MetadataValue.int(sum(1 for p in product_records if p['product_category'] == 'SPIRITS'))
+    })
+
+    return {
+        'dimension_name': 'products',
+        'records': product_records,
+        'primary_key': 'product_id',
+        'record_count': len(product_records),
+        'partition_date': date_str,
+        'generation_timestamp': datetime.now().isoformat()
+    }
+
+
+# Helper functions
+
+def _is_us_holiday(dt: date) -> bool:
+    """Basic US holiday detection."""
+    # New Year's Day
+    if dt.month == 1 and dt.day == 1:
+        return True
+    # Independence Day
+    if dt.month == 7 and dt.day == 4:
+        return True
+    # Christmas
+    if dt.month == 12 and dt.day == 25:
+        return True
+    # Add more holidays as needed
+    return False
+
+
+def _get_season(month: int) -> str:
+    """Get season from month."""
+    if month in [12, 1, 2]:
+        return 'Winter'
+    elif month in [3, 4, 5]:
+        return 'Spring'
+    elif month in [6, 7, 8]:
+        return 'Summer'
+    else:
+        return 'Fall'
+
+
+def _create_company_key(business_name: str, mailing_address: Optional[str]) -> str:
+    """Create unique company key for deduplication."""
+    key_string = f"{business_name.strip().upper()}|{(mailing_address or '').strip().upper()}"
+    return hashlib.md5(key_string.encode()).hexdigest()
+
+
+def _create_company_id(business_name: str, mailing_address: Optional[str]) -> int:
+    """Create numeric company ID for star schema."""
+    key_string = f"{business_name.strip().upper()}|{(mailing_address or '').strip().upper()}"
+    return int(hashlib.md5(key_string.encode()).hexdigest()[:8], 16)
+
+
+def _create_product_key(brand_name: str, fanciful_name: Optional[str]) -> str:
+    """Create unique product key for deduplication."""
+    key_string = f"{brand_name.strip().upper()}|{(fanciful_name or '').strip().upper()}"
+    return hashlib.md5(key_string.encode()).hexdigest()
+
+
+def _create_product_id(brand_name: str, fanciful_name: Optional[str]) -> int:
+    """Create numeric product ID for star schema."""
+    key_string = f"{brand_name.strip().upper()}|{(fanciful_name or '').strip().upper()}"
+    return int(hashlib.md5(key_string.encode()).hexdigest()[:8], 16)
+
+
+def _calculate_company_quality_score(record: Dict[str, Any]) -> float:
+    """Calculate data quality score for company record."""
+    score_components = []
+
+    # Business name quality
+    business_name = record.get('applicant_business_name', '')
+    if business_name:
+        score_components.append(0.3)  # Has business name
+        if len(business_name) > 5:
+            score_components.append(0.1)  # Substantial name
+
+    # Address quality
+    address = record.get('applicant_mailing_address', '')
+    if address:
+        score_components.append(0.3)  # Has address
+        if ',' in address:  # Structured address
+            score_components.append(0.1)
+
+    # Contact info quality
+    if record.get('applicant_phone'):
+        score_components.append(0.15)
+    if record.get('applicant_email'):
+        score_components.append(0.15)
+
+    return min(sum(score_components), 1.0)
+
+
+def _calculate_product_quality_score(record: Dict[str, Any]) -> float:
+    """Calculate data quality score for product record."""
+    score_components = []
+
+    # Brand name quality
+    if record.get('brand_name'):
+        score_components.append(0.25)
+
+    # Product classification
+    if record.get('class_type_code'):
+        score_components.append(0.2)
+    if record.get('origin_code'):
+        score_components.append(0.15)
+
+    # Product details
+    if record.get('product_description'):
+        score_components.append(0.2)
+    if record.get('alcohol_content'):
+        score_components.append(0.1)
+    if record.get('net_contents'):
+        score_components.append(0.1)
+
+    return min(sum(score_components), 1.0)

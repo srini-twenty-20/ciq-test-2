@@ -148,18 +148,12 @@ class TTBPartitionConfig(Config):
     partition_start_date: str = "2024-01-01"
     partition_end_date: str = "2024-01-01"
 
-    # Method/type partitions
-    receipt_methods: List[str] = ["001"]  # Default to testing with single method
-    data_types: List[str] = ["cola-detail"]  # Default to testing with single type
-
     @classmethod
     def for_testing(cls) -> "TTBPartitionConfig":
         """Get minimal partition config for testing."""
         return cls(
             partition_start_date=EnvVar("TTB_PARTITION_START_DATE").get_value("2024-01-01"),
-            partition_end_date=EnvVar("TTB_PARTITION_END_DATE").get_value("2024-01-01"),
-            receipt_methods=EnvVar("TTB_RECEIPT_METHODS").get_value("001").split(","),
-            data_types=EnvVar("TTB_DATA_TYPES").get_value("cola-detail").split(",")
+            partition_end_date=EnvVar("TTB_PARTITION_END_DATE").get_value("2024-01-01")
         )
 
     @classmethod
@@ -167,7 +161,5 @@ class TTBPartitionConfig(Config):
         """Get full partition config for production."""
         return cls(
             partition_start_date=EnvVar("TTB_PARTITION_START_DATE").get_value("2015-01-01"),
-            partition_end_date=EnvVar("TTB_PARTITION_END_DATE").get_value("2025-12-31"),
-            receipt_methods=EnvVar("TTB_RECEIPT_METHODS").get_value("001,002,003,000").split(","),
-            data_types=EnvVar("TTB_DATA_TYPES").get_value("cola-detail,certificate").split(",")
+            partition_end_date=EnvVar("TTB_PARTITION_END_DATE").get_value("2025-12-31")
         )

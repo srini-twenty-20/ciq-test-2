@@ -19,11 +19,7 @@ from .environments import (
 )
 from .ttb_partitions import (
     daily_partitions,
-    method_type_partitions,
-    ttb_partitions,
-    get_configurable_daily_partitions,
-    get_configurable_method_type_partitions,
-    get_configurable_ttb_partitions
+    get_configurable_daily_partitions
 )
 
 __all__ = [
@@ -36,9 +32,5 @@ __all__ = [
     "get_production_config",
     "get_test_config",
     "daily_partitions",
-    "method_type_partitions",
-    "ttb_partitions",
-    "get_configurable_daily_partitions",
-    "get_configurable_method_type_partitions",
-    "get_configurable_ttb_partitions"
+    "get_configurable_daily_partitions"
 ]

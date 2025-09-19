@@ -1,404 +1,396 @@
 """
 Fact Table Assets
 
-This module contains fact tables that form the core of the star schema.
-Fact tables contain quantitative measures and foreign keys to dimensions.
+This module creates fact tables for the TTB star schema.
+Fact tables contain foreign keys to dimensions and measurable business metrics.
 """
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
+import hashlib
 from datetime import datetime, date
 from typing import Dict, Any, List, Optional
-import hashlib
-import tempfile
 
 from dagster import (
     asset,
-    AssetExecutionContext,
-    get_dagster_logger,
     Config,
+    get_dagster_logger,
+    AssetExecutionContext,
     MetadataValue,
     AssetDep
 )
-from dagster_aws.s3 import S3Resource
 
-from .consolidated import ttb_consolidated_data
-from .dimensional import dim_dates, dim_companies, dim_locations, dim_product_types
 from ..config.ttb_partitions import daily_partitions
-from ..utils.ttb_consolidated_schema import get_dimension_schemas
+from .processed import ttb_structured_data
+from .dimensional import dim_companies, dim_products, dim_dates
 
 
 class FactConfig(Config):
     """Configuration for fact table assets."""
-    s3_bucket: str = "ciq-dagster"
-    output_prefix: str = "4-ttb-analytics"
-
-
-def _create_date_id(date_val) -> Optional[int]:
-    """Convert date to date_id format (YYYYMMDD)."""
-    if pd.isna(date_val) or date_val is None:
-        return None
-
-    if isinstance(date_val, str):
-        try:
-            date_val = pd.to_datetime(date_val).date()
-        except:
-            return None
-    elif isinstance(date_val, datetime):
-        date_val = date_val.date()
-
-    if isinstance(date_val, date):
-        return int(date_val.strftime('%Y%m%d'))
-
-    return None
-
-
-def _create_company_id(business_name: str, mailing_address: str) -> Optional[int]:
-    """Create company_id hash matching dim_companies logic."""
-    if pd.isna(business_name) or business_name is None:
-        return None
-
-    company_hash = hashlib.md5(
-        f"{business_name}|{mailing_address}".encode()
-    ).hexdigest()[:16]
-
-    return int(company_hash[:8], 16)
-
-
-def _calculate_days_to_approval(filing_date, approval_date) -> Optional[int]:
-    """Calculate days between filing and approval."""
-    if pd.isna(filing_date) or pd.isna(approval_date):
-        return None
-
-    try:
-        if isinstance(filing_date, str):
-            filing_date = pd.to_datetime(filing_date).date()
-        if isinstance(approval_date, str):
-            approval_date = pd.to_datetime(approval_date).date()
-
-        return (approval_date - filing_date).days
-    except:
-        return None
-
-
-def _calculate_data_quality_score(row: pd.Series) -> float:
-    """Calculate data quality score for a record."""
-    critical_fields = [
-        'ttb_id', 'applicant_business_name', 'cola_brand_name',
-        'cola_product_description', 'cola_approval_date'
-    ]
-
-    important_fields = [
-        'cola_filing_date', 'cola_net_contents', 'cola_alcohol_content',
-        'cola_origin_code', 'cola_product_class_type'
-    ]
-
-    # Count non-null critical fields
-    critical_score = sum(1 for field in critical_fields if field in row and pd.notna(row[field])) / len(critical_fields)
-
-    # Count non-null important fields
-    important_score = sum(1 for field in important_fields if field in row and pd.notna(row[field])) / len(important_fields)
-
-    # Weighted average (critical fields worth more)
-    return (critical_score * 0.7) + (important_score * 0.3)
+    enable_data_quality_metrics: bool = True
+    calculate_business_metrics: bool = True
 
 
 @asset(
     partitions_def=daily_partitions,
     group_name="ttb_facts",
-    description="Product fact table with measures and dimension keys",
-    deps=[
-        AssetDep(ttb_consolidated_data),
-        AssetDep(dim_dates),
-        AssetDep(dim_companies),
-        AssetDep(dim_locations),
-        AssetDep(dim_product_types)
-    ],
+    description="Product fact table with foreign keys to dimensions",
+    deps=[AssetDep(ttb_structured_data), AssetDep(dim_companies), AssetDep(dim_products)],
     metadata={
-        "fact_type": "products",
-        "grain": "ttb_id",
-        "format": "parquet"
+        "data_type": "fact",
+        "schema": "star",
+        "format": "json"
     }
 )
 def fact_products(
     context: AssetExecutionContext,
     config: FactConfig,
-    s3_resource: S3Resource
+    ttb_structured_data: Dict[str, Any],
+    dim_companies: Dict[str, Any],
+    dim_products: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Create product fact table from consolidated TTB data.
+    Create product fact table with foreign keys to dimensions.
 
-    This fact table contains one record per TTB product with measures
-    and foreign keys to dimension tables.
+    Links structured TTB data to company and product dimensions
+    for star schema analytics.
+
+    Args:
+        ttb_structured_data: Structured TTB data
+        dim_companies: Company dimension data
+        dim_products: Product dimension data
 
     Returns:
-        Dictionary containing fact table statistics
+        Dictionary containing fact table data
     """
     logger = get_dagster_logger()
 
-    # Get partition information
-    partition_date_str = context.partition_key
-    partition_date = datetime.strptime(partition_date_str, "%Y-%m-%d").date()
+    date_str = context.partition_key
+    logger.info(f"Creating product fact table for {date_str}")
 
-    logger.info(f"Creating product facts for date: {partition_date}")
+    # Get structured records
+    structured_records = ttb_structured_data.get('structured_records', [])
 
-    s3_client = s3_resource.get_client()
+    # Create lookup dictionaries for foreign keys
+    company_lookup = _create_company_lookup(dim_companies.get('records', []))
+    product_lookup = _create_product_lookup(dim_products.get('records', []))
 
-    try:
-        # Read consolidated data from S3
-        consolidated_key = f"3-ttb-consolidated/consolidated/{partition_date_str}/consolidated_data.parquet"
+    fact_records = []
+    stats = {
+        'total_records': len(structured_records),
+        'fact_records_created': 0,
+        'missing_company_keys': 0,
+        'missing_product_keys': 0,
+        'quality_scores': []
+    }
+
+    for record in structured_records:
+        # Only process records with COLA detail data for products
+        if not record.get('has_cola_detail'):
+            continue
 
         try:
-            file_response = s3_client.get_object(Bucket=config.s3_bucket, Key=consolidated_key)
-            with tempfile.NamedTemporaryFile() as tmp_file:
-                tmp_file.write(file_response['Body'].read())
-                tmp_file.flush()
-                df = pd.read_parquet(tmp_file.name)
+            # Get foreign keys
+            company_id = _get_company_foreign_key(record, company_lookup)
+            product_id = _get_product_foreign_key(record, product_lookup)
 
-            logger.info(f"Loaded {len(df)} consolidated records")
+            # Create date keys
+            filing_date_id = _create_date_id(record.get('filing_date'))
+            approval_date_id = _create_date_id(record.get('approval_date'))
+            expiration_date_id = _create_date_id(record.get('expiration_date'))
+
+            # Track missing keys
+            if not company_id:
+                stats['missing_company_keys'] += 1
+            if not product_id:
+                stats['missing_product_keys'] += 1
+
+            # Create fact record
+            fact_record = {
+                # Primary key
+                'product_fact_id': _create_product_fact_id(record.get('ttb_id')),
+                'ttb_id': record.get('ttb_id'),
+
+                # Foreign keys to dimensions
+                'company_id': company_id,
+                'product_id': product_id,
+                'filing_date_id': filing_date_id,
+                'approval_date_id': approval_date_id,
+                'expiration_date_id': expiration_date_id,
+
+                # Measures and metrics
+                'final_quality_score': record.get('final_quality_score', 0.0),
+                'data_completeness_score': record.get('data_completeness_score', 0.0),
+                'days_to_approval': record.get('days_to_approval'),
+                'has_certificate_data': record.get('has_certificate', False),
+                'has_cola_detail_data': record.get('has_cola_detail', False),
+
+                # Business attributes
+                'class_type_code': record.get('class_type_code', ''),
+                'origin_code': record.get('origin_code', ''),
+                'product_category': record.get('product_category', 'OTHER'),
+                'status': record.get('status', ''),
+                'serial_number': record.get('serial_number'),
+                'vendor_code': record.get('vendor_code'),
+
+                # Dates
+                'filing_date': record.get('filing_date'),
+                'approval_date': record.get('approval_date'),
+                'expiration_date': record.get('expiration_date'),
+
+                # Technical metadata
+                'partition_date': date_str,
+                'fact_creation_timestamp': datetime.now().isoformat(),
+                'source_extraction_timestamp': record.get('extraction_timestamp'),
+                'source_cleaning_timestamp': record.get('cleaning_timestamp'),
+                'source_structuring_timestamp': record.get('structuring_timestamp')
+            }
+
+            fact_records.append(fact_record)
+            stats['fact_records_created'] += 1
+            stats['quality_scores'].append(record.get('final_quality_score', 0.0))
 
         except Exception as e:
-            logger.warning(f"No consolidated data found for {partition_date_str}: {e}")
-            # Create empty fact table
-            df = pd.DataFrame()
+            logger.error(f"Error creating fact record for TTB ID {record.get('ttb_id')}: {e}")
 
-        if not df.empty:
-            # Create fact_products from consolidated data
-            fact_data = []
+    # Calculate statistics
+    avg_quality_score = sum(stats['quality_scores']) / len(stats['quality_scores']) if stats['quality_scores'] else 0.0
 
-            for _, row in df.iterrows():
-                # Create dimension foreign keys
-                date_id = _create_date_id(row.get('cola_approval_date'))
-                company_id = _create_company_id(
-                    row.get('applicant_business_name'),
-                    row.get('applicant_mailing_address')
-                )
+    logger.info(f"Created {stats['fact_records_created']} product fact records")
+    logger.info(f"Missing foreign keys: {stats['missing_company_keys']} companies, {stats['missing_product_keys']} products")
+    logger.info(f"Average quality score: {avg_quality_score:.2f}")
 
-                # Calculate measures
-                days_to_approval = _calculate_days_to_approval(
-                    row.get('cola_filing_date'),
-                    row.get('cola_approval_date')
-                )
-                data_quality_score = _calculate_data_quality_score(row)
+    # Add metadata
+    context.add_output_metadata({
+        "fact_records_created": MetadataValue.int(stats['fact_records_created']),
+        "source_records": MetadataValue.int(stats['total_records']),
+        "missing_company_keys": MetadataValue.int(stats['missing_company_keys']),
+        "missing_product_keys": MetadataValue.int(stats['missing_product_keys']),
+        "average_quality_score": MetadataValue.float(avg_quality_score),
+        "partition_date": MetadataValue.text(date_str)
+    })
 
-                fact_record = {
-                    'ttb_id': row.get('ttb_id'),
-                    'date_id': date_id,
-                    'company_id': company_id,
-                    'product_type_id': 1,  # Placeholder for now
-                    'location_id': 1,      # Placeholder for now
-
-                    # Measures
-                    'alcohol_content': row.get('cola_alcohol_content'),
-                    'net_contents_ml': row.get('cola_net_contents'),
-                    'days_to_approval': days_to_approval,
-                    'data_quality_score': data_quality_score,
-
-                    # Product attributes
-                    'brand_name': row.get('cola_brand_name'),
-                    'product_description': row.get('cola_product_description'),
-                    'approval_status': row.get('cola_approval_status', 'Unknown'),
-
-                    # Metadata
-                    'created_date': datetime.now().date(),
-                    'partition_date': partition_date
-                }
-
-                fact_data.append(fact_record)
-
-            fact_df = pd.DataFrame(fact_data)
-
-            # Save to S3
-            output_key = f"{config.output_prefix}/facts/fact_products/partition_date={partition_date_str}/fact_products.parquet"
-
-            table = pa.Table.from_pandas(fact_df)
-            with tempfile.NamedTemporaryFile() as tmp_file:
-                pq.write_table(table, tmp_file.name)
-                tmp_file.seek(0)
-
-                s3_client.put_object(
-                    Bucket=config.s3_bucket,
-                    Key=output_key,
-                    Body=tmp_file.read(),
-                    ContentType='application/octet-stream'
-                )
-
-            logger.info(f"Created {len(fact_df)} product facts saved to {output_key}")
-
-            # Calculate statistics
-            avg_data_quality = fact_df['data_quality_score'].mean()
-            avg_days_to_approval = fact_df['days_to_approval'].mean() if fact_df['days_to_approval'].notna().any() else 0
-
-            # Add metadata
-            context.add_output_metadata({
-                "partition_date": MetadataValue.text(partition_date_str),
-                "total_products": MetadataValue.int(len(fact_df)),
-                "avg_data_quality_score": MetadataValue.float(avg_data_quality),
-                "avg_days_to_approval": MetadataValue.float(avg_days_to_approval),
-                "unique_companies": MetadataValue.int(fact_df['company_id'].nunique()),
-                "output_location": MetadataValue.text(f"s3://{config.s3_bucket}/{output_key}")
-            })
-
-            return {
-                "partition_date": partition_date_str,
-                "total_products": len(fact_df),
-                "avg_data_quality_score": avg_data_quality,
-                "avg_days_to_approval": avg_days_to_approval
-            }
-
-        else:
-            # No data case
-            context.add_output_metadata({
-                "partition_date": MetadataValue.text(partition_date_str),
-                "total_products": MetadataValue.int(0),
-                "status": MetadataValue.text("No consolidated data available")
-            })
-
-            return {
-                "partition_date": partition_date_str,
-                "total_products": 0,
-                "status": "No data"
-            }
-
-    except Exception as e:
-        logger.error(f"Error creating product facts: {e}")
-        raise
+    return {
+        'fact_name': 'products',
+        'records': fact_records,
+        'primary_key': 'product_fact_id',
+        'foreign_keys': ['company_id', 'product_id', 'filing_date_id', 'approval_date_id', 'expiration_date_id'],
+        'record_count': len(fact_records),
+        'partition_date': date_str,
+        'statistics': stats,
+        'generation_timestamp': datetime.now().isoformat()
+    }
 
 
 @asset(
     partitions_def=daily_partitions,
     group_name="ttb_facts",
-    description="Certificate fact table with regulatory measures",
-    deps=[
-        AssetDep(ttb_consolidated_data),
-        AssetDep(dim_dates),
-        AssetDep(dim_companies)
-    ],
+    description="Certificate fact table with regulatory and compliance metrics",
+    deps=[AssetDep(ttb_structured_data), AssetDep(dim_companies)],
     metadata={
-        "fact_type": "certificates",
-        "grain": "certificate_id",
-        "format": "parquet"
+        "data_type": "fact",
+        "schema": "star",
+        "format": "json"
     }
 )
 def fact_certificates(
     context: AssetExecutionContext,
     config: FactConfig,
-    s3_resource: S3Resource
+    ttb_structured_data: Dict[str, Any],
+    dim_companies: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Create certificate fact table from consolidated TTB data.
+    Create certificate fact table for regulatory compliance analytics.
 
-    This fact table contains certificate-specific measures and
-    regulatory information.
+    Links certificate data to company dimensions for compliance tracking.
+
+    Args:
+        ttb_structured_data: Structured TTB data
+        dim_companies: Company dimension data
 
     Returns:
-        Dictionary containing certificate fact statistics
+        Dictionary containing certificate fact table data
     """
     logger = get_dagster_logger()
 
-    # Get partition information
-    partition_date_str = context.partition_key
-    partition_date = datetime.strptime(partition_date_str, "%Y-%m-%d").date()
+    date_str = context.partition_key
+    logger.info(f"Creating certificate fact table for {date_str}")
 
-    logger.info(f"Creating certificate facts for date: {partition_date}")
+    # Get structured records
+    structured_records = ttb_structured_data.get('structured_records', [])
 
-    s3_client = s3_resource.get_client()
+    # Create lookup dictionary for foreign keys
+    company_lookup = _create_company_lookup(dim_companies.get('records', []))
 
-    try:
-        # Read consolidated data from S3 (filtered for certificate data)
-        consolidated_key = f"3-ttb-consolidated/consolidated/{partition_date_str}/consolidated_data.parquet"
+    fact_records = []
+    stats = {
+        'total_records': len(structured_records),
+        'fact_records_created': 0,
+        'missing_company_keys': 0,
+        'approved_certificates': 0,
+        'quality_scores': []
+    }
+
+    for record in structured_records:
+        # Only process records with certificate data
+        if not record.get('has_certificate'):
+            continue
 
         try:
-            file_response = s3_client.get_object(Bucket=config.s3_bucket, Key=consolidated_key)
-            with tempfile.NamedTemporaryFile() as tmp_file:
-                tmp_file.write(file_response['Body'].read())
-                tmp_file.flush()
-                df = pd.read_parquet(tmp_file.name)
+            # Get foreign keys
+            company_id = _get_company_foreign_key(record, company_lookup)
 
-            # Filter for certificate records (could have cert-specific fields)
-            cert_df = df[df.get('data_type', '') == 'certificate'] if 'data_type' in df.columns else df
+            # Create date keys
+            application_date_id = _create_date_id(record.get('cert_application_date'))
+            approval_date_id = _create_date_id(record.get('cert_approval_date'))
 
-            logger.info(f"Loaded {len(cert_df)} certificate records")
+            # Track missing keys
+            if not company_id:
+                stats['missing_company_keys'] += 1
+
+            # Check if approved
+            cert_status = record.get('cert_status', '').upper()
+            is_approved = 'APPROVED' in cert_status
+            if is_approved:
+                stats['approved_certificates'] += 1
+
+            # Create certificate fact record
+            fact_record = {
+                # Primary key
+                'certificate_fact_id': _create_certificate_fact_id(record.get('ttb_id')),
+                'ttb_id': record.get('ttb_id'),
+
+                # Foreign keys to dimensions
+                'company_id': company_id,
+                'application_date_id': application_date_id,
+                'approval_date_id': approval_date_id,
+
+                # Certificate measures and metrics
+                'final_quality_score': record.get('final_quality_score', 0.0),
+                'data_completeness_score': record.get('data_completeness_score', 0.0),
+                'is_approved': is_approved,
+                'has_cola_detail_data': record.get('has_cola_detail', False),
+
+                # Certificate attributes
+                'certificate_status': record.get('cert_status', ''),
+                'certificate_type': record.get('cert_certificate_type', ''),
+                'serial_number': record.get('cert_serial_number'),
+                'plant_registry_number': record.get('cert_plant_registry_number', ''),
+
+                # Dates
+                'application_date': record.get('cert_application_date'),
+                'approval_date': record.get('cert_approval_date'),
+
+                # Technical metadata
+                'partition_date': date_str,
+                'fact_creation_timestamp': datetime.now().isoformat(),
+                'source_extraction_timestamp': record.get('extraction_timestamp'),
+                'source_cleaning_timestamp': record.get('cleaning_timestamp'),
+                'source_structuring_timestamp': record.get('structuring_timestamp')
+            }
+
+            fact_records.append(fact_record)
+            stats['fact_records_created'] += 1
+            stats['quality_scores'].append(record.get('final_quality_score', 0.0))
 
         except Exception as e:
-            logger.warning(f"No certificate data found for {partition_date_str}: {e}")
-            cert_df = pd.DataFrame()
+            logger.error(f"Error creating certificate fact record for TTB ID {record.get('ttb_id')}: {e}")
 
-        if not cert_df.empty:
-            # Create fact_certificates from certificate data
-            fact_data = []
+    # Calculate statistics
+    avg_quality_score = sum(stats['quality_scores']) / len(stats['quality_scores']) if stats['quality_scores'] else 0.0
+    approval_rate = stats['approved_certificates'] / stats['fact_records_created'] if stats['fact_records_created'] else 0.0
 
-            for _, row in cert_df.iterrows():
-                # Create dimension foreign keys
-                date_id = _create_date_id(row.get('cert_approval_date'))
-                company_id = _create_company_id(
-                    row.get('applicant_business_name'),
-                    row.get('applicant_mailing_address')
-                )
+    logger.info(f"Created {stats['fact_records_created']} certificate fact records")
+    logger.info(f"Approval rate: {approval_rate:.2%}")
+    logger.info(f"Missing company keys: {stats['missing_company_keys']}")
 
-                fact_record = {
-                    'certificate_id': row.get('ttb_id'),  # Use TTB ID as certificate ID
-                    'date_id': date_id,
-                    'company_id': company_id,
+    # Add metadata
+    context.add_output_metadata({
+        "fact_records_created": MetadataValue.int(stats['fact_records_created']),
+        "source_records": MetadataValue.int(stats['total_records']),
+        "approved_certificates": MetadataValue.int(stats['approved_certificates']),
+        "approval_rate": MetadataValue.float(approval_rate),
+        "missing_company_keys": MetadataValue.int(stats['missing_company_keys']),
+        "average_quality_score": MetadataValue.float(avg_quality_score),
+        "partition_date": MetadataValue.text(date_str)
+    })
 
-                    # Certificate-specific measures
-                    'plant_registry_number': row.get('cert_plant_registry_number'),
-                    'certificate_type': row.get('cert_type', 'Unknown'),
-                    'approval_status': row.get('cert_approval_status', 'Unknown'),
+    return {
+        'fact_name': 'certificates',
+        'records': fact_records,
+        'primary_key': 'certificate_fact_id',
+        'foreign_keys': ['company_id', 'application_date_id', 'approval_date_id'],
+        'record_count': len(fact_records),
+        'partition_date': date_str,
+        'statistics': stats,
+        'generation_timestamp': datetime.now().isoformat()
+    }
 
-                    # Metadata
-                    'created_date': datetime.now().date(),
-                    'partition_date': partition_date
-                }
 
-                fact_data.append(fact_record)
+# Helper functions
 
-            fact_df = pd.DataFrame(fact_data)
+def _create_company_lookup(company_records: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Create lookup dictionary for company foreign keys."""
+    lookup = {}
+    for company in company_records:
+        business_name = company.get('business_name', '').strip().upper()
+        mailing_address = company.get('mailing_address', '').strip().upper()
+        key = f"{business_name}|{mailing_address}"
+        lookup[key] = company.get('company_id')
+    return lookup
 
-            # Save to S3
-            output_key = f"{config.output_prefix}/facts/fact_certificates/partition_date={partition_date_str}/fact_certificates.parquet"
 
-            table = pa.Table.from_pandas(fact_df)
-            with tempfile.NamedTemporaryFile() as tmp_file:
-                pq.write_table(table, tmp_file.name)
-                tmp_file.seek(0)
+def _create_product_lookup(product_records: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Create lookup dictionary for product foreign keys."""
+    lookup = {}
+    for product in product_records:
+        brand_name = product.get('brand_name', '').strip().upper()
+        fanciful_name = product.get('fanciful_name', '').strip().upper()
+        key = f"{brand_name}|{fanciful_name}"
+        lookup[key] = product.get('product_id')
+    return lookup
 
-                s3_client.put_object(
-                    Bucket=config.s3_bucket,
-                    Key=output_key,
-                    Body=tmp_file.read(),
-                    ContentType='application/octet-stream'
-                )
 
-            logger.info(f"Created {len(fact_df)} certificate facts saved to {output_key}")
+def _get_company_foreign_key(record: Dict[str, Any], company_lookup: Dict[str, int]) -> Optional[int]:
+    """Get company foreign key for a record."""
+    business_name = record.get('applicant_business_name', '').strip().upper()
+    mailing_address = record.get('applicant_mailing_address', '').strip().upper()
+    key = f"{business_name}|{mailing_address}"
+    return company_lookup.get(key)
 
-            # Add metadata
-            context.add_output_metadata({
-                "partition_date": MetadataValue.text(partition_date_str),
-                "total_certificates": MetadataValue.int(len(fact_df)),
-                "unique_companies": MetadataValue.int(fact_df['company_id'].nunique()),
-                "output_location": MetadataValue.text(f"s3://{config.s3_bucket}/{output_key}")
-            })
 
-            return {
-                "partition_date": partition_date_str,
-                "total_certificates": len(fact_df)
-            }
+def _get_product_foreign_key(record: Dict[str, Any], product_lookup: Dict[str, int]) -> Optional[int]:
+    """Get product foreign key for a record."""
+    brand_name = record.get('brand_name', '').strip().upper()
+    fanciful_name = record.get('fanciful_name', '').strip().upper()
+    key = f"{brand_name}|{fanciful_name}"
+    return product_lookup.get(key)
 
-        else:
-            # No data case
-            context.add_output_metadata({
-                "partition_date": MetadataValue.text(partition_date_str),
-                "total_certificates": MetadataValue.int(0),
-                "status": MetadataValue.text("No certificate data available")
-            })
 
-            return {
-                "partition_date": partition_date_str,
-                "total_certificates": 0,
-                "status": "No data"
-            }
+def _create_date_id(date_val) -> Optional[int]:
+    """Convert date to date_id format (YYYYMMDD)."""
+    if not date_val:
+        return None
 
-    except Exception as e:
-        logger.error(f"Error creating certificate facts: {e}")
-        raise
+    try:
+        if isinstance(date_val, str):
+            # Parse ISO date string
+            dt = datetime.fromisoformat(date_val.replace('Z', '+00:00'))
+            return int(dt.strftime('%Y%m%d'))
+        elif isinstance(date_val, datetime):
+            return int(date_val.strftime('%Y%m%d'))
+        elif isinstance(date_val, date):
+            return int(date_val.strftime('%Y%m%d'))
+    except Exception:
+        pass
+
+    return None
+
+
+def _create_product_fact_id(ttb_id: str) -> int:
+    """Create unique product fact ID."""
+    key_string = f"product_{ttb_id}"
+    return int(hashlib.md5(key_string.encode()).hexdigest()[:8], 16)
+
+
+def _create_certificate_fact_id(ttb_id: str) -> int:
+    """Create unique certificate fact ID."""
+    key_string = f"certificate_{ttb_id}"
+    return int(hashlib.md5(key_string.encode()).hexdigest()[:8], 16)

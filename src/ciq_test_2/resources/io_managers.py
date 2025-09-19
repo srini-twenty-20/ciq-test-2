@@ -66,26 +66,16 @@ class TTBS3IOManager(ConfigurableIOManager):
 
         format_type = asset_metadata.get("format", "parquet")
 
-        # Build S3 key with legacy-compatible structure
+        # Build S3 key - skip IO manager output for raw data assets since they handle their own S3 storage
+        if asset_name == 'ttb_raw_data':
+            # Raw data assets handle their own S3 storage, so skip IO manager processing
+            return None
+
+        # Build S3 key for other assets
         if hasattr(context, 'partition_key') and context.partition_key:
             if context.has_partition_key:
-                # Handle partitioned assets
-                if "|" in context.partition_key:
-                    # Multi-dimensional partition (date|method_type)
-                    # Format: "2024-01-01|001-cola-detail"
-                    date_str, method_type = context.partition_key.split("|", 1)
-                    receipt_method, data_type = method_type.split("-", 1)
-
-                    # Parse date for legacy path structure
-                    from datetime import datetime
-                    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-
-                    # Legacy format: data_type=cola-detail/year=2024/month=01/day=01/receipt_method=001/
-                    return f"{s3_prefix}/data_type={data_type}/year={date_obj.year}/month={date_obj.month:02d}/day={date_obj.day:02d}/receipt_method={receipt_method}/{asset_name}.{format_type}"
-                else:
-                    # Single dimension partition (daily)
-                    # Format: partition_date=2024-01-01/asset_name.format
-                    return f"{s3_prefix}/{asset_name}/partition_date={context.partition_key}/{asset_name}.{format_type}"
+                # Handle daily partitioned assets
+                return f"{s3_prefix}/partition_date={context.partition_key}/{asset_name}.{format_type}"
             else:
                 return f"{s3_prefix}/{asset_name}.{format_type}"
         else:
@@ -96,6 +86,12 @@ class TTBS3IOManager(ConfigurableIOManager):
         """Handle output to S3 based on data type."""
         s3_client = self._get_s3_client()
         s3_key = self._get_s3_key(context)
+
+        # Skip IO manager processing if s3_key is None (raw assets handle their own storage)
+        if s3_key is None:
+            context.log.info("Skipping IO manager output - asset handles its own S3 storage")
+            return
+
         format_type = context.metadata.get("format", "json")
 
         context.log.info(f"Writing {format_type} data to s3://{self.bucket_name}/{s3_key}")
@@ -186,22 +182,10 @@ class TTBS3IOManager(ConfigurableIOManager):
             s3_prefix = self.processed_data_prefix  # Default fallback
             format_type = "parquet"
 
-        # Build S3 key with legacy-compatible structure (same as handle_output)
+        # Build S3 key for daily partitioned assets only
         if hasattr(context, 'asset_partition_key') and context.asset_partition_key:
-            if "|" in context.asset_partition_key:
-                # Multi-dimensional partition (date|method_type)
-                date_str, method_type = context.asset_partition_key.split("|", 1)
-                receipt_method, data_type = method_type.split("-", 1)
-
-                # Parse date for legacy path structure
-                from datetime import datetime
-                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-
-                # Legacy format: data_type=cola-detail/year=2024/month=01/day=01/receipt_method=001/
-                s3_key = f"{s3_prefix}/data_type={data_type}/year={date_obj.year}/month={date_obj.month:02d}/day={date_obj.day:02d}/receipt_method={receipt_method}/{asset_name}.{format_type}"
-            else:
-                # Single dimension partition (daily)
-                s3_key = f"{s3_prefix}/{asset_name}/partition_date={context.asset_partition_key}/{asset_name}.{format_type}"
+            # Daily partition
+            s3_key = f"{s3_prefix}/partition_date={context.asset_partition_key}/{asset_name}.{format_type}"
         else:
             # Non-partitioned assets
             s3_key = f"{s3_prefix}/{asset_name}.{format_type}"

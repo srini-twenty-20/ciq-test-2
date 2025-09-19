@@ -35,13 +35,21 @@ raw_extraction_assets = AssetSelection.assets(
 
 # Consolidated and dimensional assets (daily partitioned)
 analytical_assets = AssetSelection.assets(
-    "ttb_consolidated_data",
     "dim_dates",
     "dim_companies",
-    "dim_locations",
-    "dim_product_types",
+    "dim_products",
     "fact_products",
     "fact_certificates"
+)
+
+# Supabase export assets (daily partitioned)
+supabase_export_assets = AssetSelection.assets(
+    "supabase_reference_data",
+    "supabase_dim_dates",
+    "supabase_dim_companies",
+    "supabase_dim_products",
+    "supabase_fact_products",
+    "ttb_supabase_export_complete"
 )
 
 # Complete end-to-end pipeline - NOTE: Cannot mix different partition definitions in a single job
@@ -67,8 +75,8 @@ ttb_raw_pipeline = define_asset_job(
 # Analytics pipeline (daily partitioned assets + reference data)
 ttb_analytics_pipeline = define_asset_job(
     name="ttb_analytics_pipeline",
-    selection=analytical_assets | AssetSelection.assets("ttb_reference_data"),
-    description="TTB analytics pipeline: consolidation → facts & dimensions",
+    selection=analytical_assets | AssetSelection.assets("ttb_reference_data", "ttb_product_class_types", "ttb_origin_codes"),
+    description="TTB analytics pipeline: dimensions & facts with reference data",
     tags={
         "pipeline_type": "analytics_daily",
         "team": "data-engineering"
@@ -93,6 +101,17 @@ ttb_analytics_only = define_asset_job(
     description="TTB analytics refresh: consolidation → facts & dimensions",
     tags={
         "pipeline_type": "analytics_refresh",
+        "team": "data-engineering"
+    }
+)
+
+# Complete Supabase export pipeline (will materialize entire upstream dependency graph)
+ttb_supabase_export = define_asset_job(
+    name="ttb_supabase_export",
+    selection=supabase_export_assets,
+    description="Complete TTB export to Supabase (materializes entire upstream pipeline)",
+    tags={
+        "pipeline_type": "supabase_export",
         "team": "data-engineering"
     }
 )
@@ -152,6 +171,7 @@ __all__ = [
     "ttb_analytics_pipeline",
     "ttb_extraction_only",
     "ttb_analytics_only",
+    "ttb_supabase_export",
 
     # Production schedules
     "ttb_daily_schedule",

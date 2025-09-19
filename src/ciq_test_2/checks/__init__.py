@@ -10,7 +10,11 @@ from .ttb_asset_checks import (
     check_field_extraction_completeness,
     check_transformation_validation_rates,
     check_schema_compliance,
-    check_reference_data_freshness
+    check_reference_data_freshness,
+    check_fact_table_integrity,
+    check_dimensional_data_quality,
+    check_reference_data_coverage,
+    check_certificate_compliance_monitoring
 )
 
 __all__ = [
@@ -18,5 +22,9 @@ __all__ = [
     "check_field_extraction_completeness",
     "check_transformation_validation_rates",
     "check_schema_compliance",
-    "check_reference_data_freshness"
+    "check_reference_data_freshness",
+    "check_fact_table_integrity",
+    "check_dimensional_data_quality",
+    "check_reference_data_coverage",
+    "check_certificate_compliance_monitoring"
 ]

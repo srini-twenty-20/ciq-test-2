@@ -19,8 +19,11 @@ from dagster import (
 
 from ..assets.raw import ttb_raw_data
 from ..assets.processed import ttb_extracted_data, ttb_cleaned_data, ttb_structured_data
+from ..assets.dimensional import dim_companies, dim_products, dim_dates
+from ..assets.facts import fact_products, fact_certificates
+from ..assets.reference import ttb_reference_data
 from ..utils.ttb_transformations import load_ttb_reference_data
-from ..config.ttb_partitions import ttb_partitions, daily_partitions
+from ..config.ttb_partitions import daily_partitions
 
 
 @asset_check(
@@ -260,7 +263,7 @@ def check_transformation_validation_rates(context: AssetCheckExecutionContext, t
             issues.append(f"High transformation error rate: {error_rate:.1f}%")
 
         passed = len(issues) == 0
-        severity = AssetCheckSeverity.WARN if issues else None
+        severity = AssetCheckSeverity.WARN if not passed else None
 
         description = f"Validation rates - TTB ID: {ttb_id_validation_rate:.1f}%, Product Class: {product_class_validation_rate:.1f}%, Origin: {origin_code_validation_rate:.1f}%"
         if issues:
@@ -423,7 +426,7 @@ def check_reference_data_freshness(context: AssetCheckExecutionContext) -> Asset
             issues.append(f"Low origin code count: {origin_codes_count} (expected ≥ {min_origin_codes})")
 
         passed = len(issues) == 0
-        severity = AssetCheckSeverity.WARN if issues else None
+        severity = AssetCheckSeverity.WARN if not passed else None
 
         description = f"Reference data loaded: {product_codes_count} product codes, {origin_codes_count} origin codes"
         if issues:
@@ -452,4 +455,466 @@ def check_reference_data_freshness(context: AssetCheckExecutionContext) -> Asset
             severity=AssetCheckSeverity.ERROR,
             description=f"Reference data check failed: {str(e)}",
             metadata={"error": str(e), "reference_data_loaded": False}
+        )
+
+
+@asset_check(
+    asset=fact_products,
+    name="fact_table_integrity",
+    description="Check fact table data integrity and foreign key relationships"
+)
+def check_fact_table_integrity(context: AssetCheckExecutionContext, fact_products) -> AssetCheckResult:
+    """
+    Verify fact table data integrity, foreign key relationships, and business logic.
+
+    Checks foreign key completeness, data quality scores, and business metrics.
+    """
+    logger = get_dagster_logger()
+
+    try:
+        fact_records = fact_products.get('records', [])
+        fact_stats = fact_products.get('statistics', {})
+
+        if not fact_records:
+            return AssetCheckResult(
+                passed=False,
+                severity=AssetCheckSeverity.ERROR,
+                description="No fact table records found",
+                metadata={"record_count": 0}
+            )
+
+        total_records = len(fact_records)
+
+        # Check foreign key integrity
+        missing_company_keys = fact_stats.get('missing_company_keys', 0)
+        missing_product_keys = fact_stats.get('missing_product_keys', 0)
+
+        company_key_integrity = ((total_records - missing_company_keys) / total_records) * 100
+        product_key_integrity = ((total_records - missing_product_keys) / total_records) * 100
+
+        # Check data quality metrics
+        quality_scores = fact_stats.get('quality_scores', [])
+        avg_quality_score = sum(quality_scores) / len(quality_scores) if quality_scores else 0
+
+        # Business logic checks
+        records_with_dates = sum(1 for record in fact_records
+                               if record.get('filing_date') and record.get('approval_date'))
+        date_completeness = (records_with_dates / total_records) * 100
+
+        # Define thresholds
+        min_foreign_key_integrity = 95.0
+        min_quality_score = 0.6
+        min_date_completeness = 80.0
+
+        issues = []
+        if company_key_integrity < min_foreign_key_integrity:
+            issues.append(f"Low company foreign key integrity: {company_key_integrity:.1f}%")
+        if product_key_integrity < min_foreign_key_integrity:
+            issues.append(f"Low product foreign key integrity: {product_key_integrity:.1f}%")
+        if avg_quality_score < min_quality_score:
+            issues.append(f"Low average quality score: {avg_quality_score:.2f}")
+        if date_completeness < min_date_completeness:
+            issues.append(f"Low date completeness: {date_completeness:.1f}%")
+
+        passed = len(issues) == 0
+        severity = AssetCheckSeverity.WARN if not passed else None
+
+        description = f"Fact table integrity: {total_records} records, FK integrity {min(company_key_integrity, product_key_integrity):.1f}%, avg quality {avg_quality_score:.2f}"
+        if issues:
+            description += f" - Issues: {'; '.join(issues)}"
+
+        return AssetCheckResult(
+            passed=passed,
+            severity=severity,
+            description=description,
+            metadata={
+                "total_records": total_records,
+                "company_key_integrity_percent": company_key_integrity,
+                "product_key_integrity_percent": product_key_integrity,
+                "missing_company_keys": missing_company_keys,
+                "missing_product_keys": missing_product_keys,
+                "average_quality_score": avg_quality_score,
+                "date_completeness_percent": date_completeness,
+                "records_with_dates": records_with_dates,
+                "issues": issues,
+                "business_metrics": {
+                    "has_cola_detail_count": sum(1 for r in fact_records if r.get('has_cola_detail_data')),
+                    "has_certificate_count": sum(1 for r in fact_records if r.get('has_certificate_data')),
+                    "approval_rate": len([r for r in fact_records if 'APPROVED' in str(r.get('status', '')).upper()]) / total_records * 100
+                }
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in fact table integrity check: {str(e)}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed due to error: {str(e)}",
+            metadata={"error": str(e)}
+        )
+
+
+@asset_check(
+    asset=dim_companies,
+    name="dimensional_data_quality",
+    description="Check dimensional table data quality and deduplication effectiveness"
+)
+def check_dimensional_data_quality(context: AssetCheckExecutionContext, dim_companies) -> AssetCheckResult:
+    """
+    Monitor dimensional table data quality, deduplication, and consistency.
+
+    Checks company deduplication, data quality scores, and dimensional integrity.
+    """
+    logger = get_dagster_logger()
+
+    try:
+        company_records = dim_companies.get('records', [])
+
+        if not company_records:
+            return AssetCheckResult(
+                passed=False,
+                severity=AssetCheckSeverity.WARN,
+                description="No company dimension records found",
+                metadata={"record_count": 0}
+            )
+
+        total_companies = len(company_records)
+
+        # Check data quality metrics
+        quality_scores = [record.get('data_quality_score', 0) for record in company_records]
+        avg_quality_score = sum(quality_scores) / len(quality_scores) if quality_scores else 0
+        low_quality_companies = sum(1 for score in quality_scores if score < 0.5)
+
+        # Check contact information completeness
+        companies_with_phone = sum(1 for record in company_records if record.get('phone'))
+        companies_with_email = sum(1 for record in company_records if record.get('email'))
+        companies_with_address = sum(1 for record in company_records if record.get('mailing_address'))
+
+        phone_completeness = (companies_with_phone / total_companies) * 100
+        email_completeness = (companies_with_email / total_companies) * 100
+        address_completeness = (companies_with_address / total_companies) * 100
+
+        # Check for potential duplicates (similar names)
+        business_names = [record.get('business_name', '').upper().strip() for record in company_records]
+        unique_names = set(business_names)
+        potential_duplicates = total_companies - len(unique_names)
+
+        # Application volume analysis
+        total_applications = sum(record.get('total_applications', 0) for record in company_records)
+        avg_applications_per_company = total_applications / total_companies if total_companies > 0 else 0
+
+        # Define thresholds
+        min_quality_score = 0.6
+        max_low_quality_percentage = 20.0
+        min_address_completeness = 90.0
+
+        issues = []
+        if avg_quality_score < min_quality_score:
+            issues.append(f"Low average quality score: {avg_quality_score:.2f}")
+
+        low_quality_percentage = (low_quality_companies / total_companies) * 100
+        if low_quality_percentage > max_low_quality_percentage:
+            issues.append(f"High percentage of low-quality companies: {low_quality_percentage:.1f}%")
+
+        if address_completeness < min_address_completeness:
+            issues.append(f"Low address completeness: {address_completeness:.1f}%")
+
+        if potential_duplicates > 0:
+            issues.append(f"Potential duplicate companies detected: {potential_duplicates}")
+
+        passed = len(issues) == 0
+        severity = AssetCheckSeverity.WARN if not passed else None
+
+        description = f"Company dimension: {total_companies} unique companies, avg quality {avg_quality_score:.2f}, {avg_applications_per_company:.1f} avg applications"
+        if issues:
+            description += f" - Issues: {'; '.join(issues)}"
+
+        return AssetCheckResult(
+            passed=passed,
+            severity=severity,
+            description=description,
+            metadata={
+                "total_companies": total_companies,
+                "average_quality_score": avg_quality_score,
+                "low_quality_companies": low_quality_companies,
+                "low_quality_percentage": low_quality_percentage,
+                "contact_completeness": {
+                    "phone_percent": phone_completeness,
+                    "email_percent": email_completeness,
+                    "address_percent": address_completeness
+                },
+                "potential_duplicates": potential_duplicates,
+                "total_applications": total_applications,
+                "avg_applications_per_company": avg_applications_per_company,
+                "issues": issues,
+                "top_companies_by_volume": sorted(
+                    [{"name": r.get('business_name'), "applications": r.get('total_applications', 0)}
+                     for r in company_records],
+                    key=lambda x: x['applications'],
+                    reverse=True
+                )[:5]
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in dimensional data quality check: {str(e)}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed due to error: {str(e)}",
+            metadata={"error": str(e)}
+        )
+
+
+@asset_check(
+    asset=ttb_reference_data,
+    name="reference_data_coverage",
+    description="Check TTB reference data coverage and accuracy"
+)
+def check_reference_data_coverage(context: AssetCheckExecutionContext, ttb_reference_data) -> AssetCheckResult:
+    """
+    Monitor TTB reference data coverage, accuracy, and freshness.
+
+    Checks reference data completeness and validates against known data patterns.
+    """
+    logger = get_dagster_logger()
+
+    try:
+        product_class_data = ttb_reference_data.get('product_class_types', {})
+        origin_codes_data = ttb_reference_data.get('origin_codes', {})
+        combined_stats = ttb_reference_data.get('statistics', {})
+
+        product_codes_count = product_class_data.get('total_records', 0)
+        origin_codes_count = origin_codes_data.get('total_records', 0)
+        total_reference_records = combined_stats.get('total_reference_records', 0)
+
+        # Check for extraction errors
+        has_product_errors = combined_stats.get('has_product_errors', False)
+        has_origin_errors = combined_stats.get('has_origin_errors', False)
+
+        # Validate reference data content quality
+        product_by_code = product_class_data.get('by_code', {})
+        origin_by_code = origin_codes_data.get('by_code', {})
+
+        # Check for empty or invalid entries
+        empty_product_descriptions = sum(1 for desc in product_by_code.values() if not desc or len(desc.strip()) < 3)
+        empty_origin_descriptions = sum(1 for desc in origin_by_code.values() if not desc or len(desc.strip()) < 3)
+
+        # Expected minimum counts based on current TTB data
+        min_product_codes = 500
+        min_origin_codes = 200
+        max_empty_percentage = 5.0
+
+        issues = []
+
+        if product_codes_count < min_product_codes:
+            issues.append(f"Low product code count: {product_codes_count} (expected ≥ {min_product_codes})")
+
+        if origin_codes_count < min_origin_codes:
+            issues.append(f"Low origin code count: {origin_codes_count} (expected ≥ {min_origin_codes})")
+
+        if has_product_errors:
+            issues.append("Product class extraction errors detected")
+
+        if has_origin_errors:
+            issues.append("Origin code extraction errors detected")
+
+        # Check data quality
+        product_empty_percentage = (empty_product_descriptions / product_codes_count) * 100 if product_codes_count > 0 else 0
+        origin_empty_percentage = (empty_origin_descriptions / origin_codes_count) * 100 if origin_codes_count > 0 else 0
+
+        if product_empty_percentage > max_empty_percentage:
+            issues.append(f"High percentage of empty product descriptions: {product_empty_percentage:.1f}%")
+
+        if origin_empty_percentage > max_empty_percentage:
+            issues.append(f"High percentage of empty origin descriptions: {origin_empty_percentage:.1f}%")
+
+        # Check extraction timestamps for freshness
+        product_extraction_time = product_class_data.get('extraction_timestamp')
+        origin_extraction_time = origin_codes_data.get('extraction_timestamp')
+
+        # Parse timestamps and check if data is recent (within last 7 days)
+        freshness_issues = []
+        if product_extraction_time:
+            try:
+                product_time = datetime.fromisoformat(product_extraction_time.replace('Z', '+00:00'))
+                if (datetime.now() - product_time).days > 7:
+                    freshness_issues.append(f"Product codes data is {(datetime.now() - product_time).days} days old")
+            except:
+                freshness_issues.append("Unable to parse product codes extraction timestamp")
+
+        if origin_extraction_time:
+            try:
+                origin_time = datetime.fromisoformat(origin_extraction_time.replace('Z', '+00:00'))
+                if (datetime.now() - origin_time).days > 7:
+                    freshness_issues.append(f"Origin codes data is {(datetime.now() - origin_time).days} days old")
+            except:
+                freshness_issues.append("Unable to parse origin codes extraction timestamp")
+
+        issues.extend(freshness_issues)
+
+        passed = len(issues) == 0
+        severity = AssetCheckSeverity.WARN if not passed else None
+
+        description = f"Reference data: {product_codes_count} product codes, {origin_codes_count} origin codes, total {total_reference_records} records"
+        if issues:
+            description += f" - Issues: {'; '.join(issues)}"
+
+        metadata = {
+            "product_codes_count": product_codes_count,
+            "origin_codes_count": origin_codes_count,
+            "total_reference_records": total_reference_records,
+            "has_extraction_errors": has_product_errors or has_origin_errors,
+            "data_quality": {
+                "empty_product_descriptions": empty_product_descriptions,
+                "empty_origin_descriptions": empty_origin_descriptions,
+                "product_empty_percentage": product_empty_percentage,
+                "origin_empty_percentage": origin_empty_percentage
+            },
+            "extraction_timestamps": {
+                "product_codes": product_extraction_time,
+                "origin_codes": origin_extraction_time
+            },
+            "issues": issues,
+            "sample_data": {
+                "product_codes": list(product_by_code.keys())[:10],
+                "origin_codes": list(origin_by_code.keys())[:10]
+            }
+        }
+
+        if passed:
+            return AssetCheckResult(
+                passed=True,
+                description=description,
+                metadata=metadata
+            )
+        else:
+            return AssetCheckResult(
+                passed=False,
+                severity=AssetCheckSeverity.WARN,
+                description=description,
+                metadata=metadata
+            )
+
+    except Exception as e:
+        logger.error(f"Error in reference data coverage check: {str(e)}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed due to error: {str(e)}",
+            metadata={"error": str(e)}
+        )
+
+
+@asset_check(
+    asset=fact_certificates,
+    name="certificate_compliance_monitoring",
+    description="Monitor certificate approval rates and compliance patterns"
+)
+def check_certificate_compliance_monitoring(context: AssetCheckExecutionContext, fact_certificates) -> AssetCheckResult:
+    """
+    Monitor certificate compliance metrics, approval rates, and regulatory patterns.
+
+    Tracks approval rates, processing times, and compliance trends.
+    """
+    logger = get_dagster_logger()
+
+    try:
+        cert_records = fact_certificates.get('records', [])
+        cert_stats = fact_certificates.get('statistics', {})
+
+        if not cert_records:
+            return AssetCheckResult(
+                passed=False,
+                severity=AssetCheckSeverity.WARN,
+                description="No certificate records found",
+                metadata={"record_count": 0}
+            )
+
+        total_certificates = len(cert_records)
+        approved_certificates = cert_stats.get('approved_certificates', 0)
+        approval_rate = (approved_certificates / total_certificates) * 100 if total_certificates > 0 else 0
+
+        # Analyze certificate types
+        cert_types = {}
+        for record in cert_records:
+            cert_type = record.get('certificate_type', 'Unknown')
+            cert_types[cert_type] = cert_types.get(cert_type, 0) + 1
+
+        # Check data quality for certificates
+        quality_scores = [record.get('final_quality_score', 0) for record in cert_records]
+        avg_quality_score = sum(quality_scores) / len(quality_scores) if quality_scores else 0
+
+        # Check completeness of key certificate fields
+        records_with_serial = sum(1 for record in cert_records if record.get('serial_number'))
+        records_with_plant_registry = sum(1 for record in cert_records if record.get('plant_registry_number'))
+        records_with_dates = sum(1 for record in cert_records
+                               if record.get('application_date') and record.get('approval_date'))
+
+        serial_completeness = (records_with_serial / total_certificates) * 100
+        plant_completeness = (records_with_plant_registry / total_certificates) * 100
+        date_completeness = (records_with_dates / total_certificates) * 100
+
+        # Compliance thresholds
+        min_approval_rate = 80.0  # Expect most certificates to be approved
+        min_quality_score = 0.6
+        min_field_completeness = 90.0
+
+        issues = []
+
+        if approval_rate < min_approval_rate:
+            issues.append(f"Low approval rate: {approval_rate:.1f}%")
+
+        if avg_quality_score < min_quality_score:
+            issues.append(f"Low average quality score: {avg_quality_score:.2f}")
+
+        if serial_completeness < min_field_completeness:
+            issues.append(f"Low serial number completeness: {serial_completeness:.1f}%")
+
+        if plant_completeness < min_field_completeness:
+            issues.append(f"Low plant registry completeness: {plant_completeness:.1f}%")
+
+        if date_completeness < min_field_completeness:
+            issues.append(f"Low date completeness: {date_completeness:.1f}%")
+
+        passed = len(issues) == 0
+        severity = AssetCheckSeverity.WARN if not passed else None
+
+        description = f"Certificate compliance: {approval_rate:.1f}% approval rate ({approved_certificates}/{total_certificates}), avg quality {avg_quality_score:.2f}"
+        if issues:
+            description += f" - Issues: {'; '.join(issues)}"
+
+        return AssetCheckResult(
+            passed=passed,
+            severity=severity,
+            description=description,
+            metadata={
+                "total_certificates": total_certificates,
+                "approved_certificates": approved_certificates,
+                "approval_rate_percent": approval_rate,
+                "average_quality_score": avg_quality_score,
+                "certificate_types": cert_types,
+                "field_completeness": {
+                    "serial_number_percent": serial_completeness,
+                    "plant_registry_percent": plant_completeness,
+                    "dates_percent": date_completeness
+                },
+                "compliance_metrics": {
+                    "records_with_serial": records_with_serial,
+                    "records_with_plant_registry": records_with_plant_registry,
+                    "records_with_dates": records_with_dates
+                },
+                "issues": issues,
+                "most_common_cert_type": max(cert_types.items(), key=lambda x: x[1])[0] if cert_types else "None"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in certificate compliance monitoring check: {str(e)}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed due to error: {str(e)}",
+            metadata={"error": str(e)}
         )

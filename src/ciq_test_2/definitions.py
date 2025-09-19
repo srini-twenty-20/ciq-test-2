@@ -5,6 +5,7 @@ Modern Dagster definitions following best practices with proper asset organizati
 resource management, and configuration.
 """
 from dagster import Definitions, load_assets_from_modules, load_asset_checks_from_modules, EnvVar
+from dagster_aws.s3 import S3PickleIOManager
 
 # Import organized asset modules
 from . import assets
@@ -26,7 +27,7 @@ from .jobs import (
 )
 
 # Import standardized resources
-from .resources import get_s3_resource, TTBStorageResource, ttb_s3_io_manager
+from .resources import get_s3_resource, TTBStorageResource, SupabaseResource, SupabaseIOManager
 
 
 def get_environment() -> str:
@@ -46,11 +47,18 @@ def get_resources_for_environment(environment: str) -> dict:
             region_name=EnvVar("AWS_REGION").get_value("us-east-1")
         ),
 
-        # IO Managers
-        "io_manager": ttb_s3_io_manager.configured({
-            "bucket_name": EnvVar("TTB_S3_BUCKET").get_value("ciq-dagster"),
-            "region_name": EnvVar("AWS_REGION").get_value("us-east-1")
-        })
+        # IO Managers - Use built-in S3PickleIOManager with clean TTB structure
+        "io_manager": S3PickleIOManager(
+            s3_bucket=EnvVar("TTB_S3_BUCKET").get_value("ciq-dagster"),
+            s3_prefix="",  # Let Dagster handle the path structure
+            s3_resource=get_s3_resource()
+        ),
+
+        # Supabase resources
+        "supabase_resource": SupabaseResource(),
+        "supabase_io_manager": SupabaseIOManager(
+            supabase_resource=SupabaseResource()
+        )
     }
 
     # Add environment-specific resource configurations
@@ -70,9 +78,10 @@ defs = Definitions(
     assets=load_assets_from_modules([
         assets.raw,
         assets.processed,
-        assets.consolidated,
+        assets.reference,
         assets.dimensional,
-        assets.facts
+        assets.facts,
+        assets.supabase_export
     ]),
 
     # Asset checks for data quality
