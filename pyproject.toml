@@ -34,4 +34,10 @@ registry_modules = [
     "ciq_test_2.components.*",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "dagster-dg-cli",
+    "dagster-webserver",
+    "pytest",
+]
 
